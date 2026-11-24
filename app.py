@@ -180,6 +180,7 @@ elif page == "个股详情":
     flow = fetch_fund_flow(code)
     hist = fetch_history(code)
     chart_real = False
+    chart_note = ""
     if flow is not None and hist is not None and len(hist) >= 30:
         fdf = flow["flow_df"].copy()
         fdf["cum_flow"] = fdf["主力净流入-净额"].cumsum() / 1e8  # 亿元
@@ -188,6 +189,14 @@ elif page == "个股详情":
         if len(merged) >= 30:
             chart_real = True
             dates, price, fund = merged["日期"], merged["收盘"], merged["cum_flow"]
+
+    if not chart_real and flow is not None and len(flow["flow_df"]) >= 30:
+        # K 线取不到时，用资金流里的收盘价画股价线（仍是真实收盘价）
+        fdf = flow["flow_df"].copy()
+        fdf["cum_flow"] = fdf["主力净流入-净额"].cumsum() / 1e8
+        chart_real = True
+        chart_note = "（快照数据）" if flow.get("snapshot") else "（资金流收盘价）"
+        dates, price, fund = fdf["日期"], fdf["收盘价"], fdf["cum_flow"]
 
     if not chart_real:
         dates = pd.date_range(end=datetime.now(), periods=60)
@@ -199,7 +208,7 @@ elif page == "个股详情":
     fig.add_trace(go.Scatter(x=dates, y=fund, name="累积资金（亿）", yaxis="y2",
                              line=dict(color="blue")))
     fig.update_layout(
-        title="股价 vs 主力资金累积" + ("（真实数据）" if chart_real else "（模拟）"),
+        title="股价 vs 主力资金累积" + ("（真实数据）" if chart_real else "（模拟）") + chart_note,
         yaxis2=dict(overlaying="y", side="right"))
     st.plotly_chart(fig, width="stretch")
     if not chart_real:
@@ -220,6 +229,13 @@ elif page == "设置":
     st.write(f"行情：{meta['quote_source']}")
     st.write(f"资金流：{meta['flow_source']}（东财口径）")
     st.write(f"更新时间：{meta['updated']}")
+    with st.expander("🔍 取数诊断（云端取不到数时看这里）"):
+        errs = meta.get("errors") or []
+        if errs:
+            for e in errs:
+                st.write("- " + e)
+        else:
+            st.write("暂无错误：本次全部取数成功。")
     if st.button("🔄 立即刷新数据"):
         st.cache_data.clear()
         st.rerun()

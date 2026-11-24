@@ -3,15 +3,18 @@
 数据来源优先级：
   行情（现价 / 涨跌幅）：同花顺 Financial-API（需 HITHINK_FINANCE_API_KEY）
                         → akshare 东财实时行情
+                        → 新浪行情（hq.sinajs.cn，不走东财）
                         → 个股资金流里的最新收盘价
                         → 模拟数据
   主力资金流向：akshare（东财口径；同花顺官方文档明确说明资金流接口
                 不对外开放，仅在同花顺 AI 客户端内部使用）
-  K 线：akshare（东财，前复权）
+                → 仓库快照 fund_flow_snapshot.json（真实数据，截至快照日）
+  K 线：akshare（东财，前复权）；取不到时个股详情图用资金流收盘价代替
 全部失败时用内置模拟数据兜底，并在界面标注数据来源。
 """
 
 import os
+import json
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -19,6 +22,17 @@ import requests
 
 THS_BASE = "https://fuyao.aicubes.cn"
 SNAPSHOT_URL = f"{THS_BASE}/api/a-share/prices/snapshot"
+
+# 诊断记录：每次取数失败的原因，展示在设置页，方便定位云端取不到数的原因
+ERRORS = []
+
+
+def _record_err(where, exc):
+    ERRORS.append(f"{where}: {type(exc).__name__}: {str(exc)[:150]}")
+
+
+def _clear_errors():
+    ERRORS.clear()
 
 # 监控池：代码、名称、分类、模拟兜底值（沿用原型 v0.1 的模拟数）
 WATCHLIST = [
@@ -150,63 +164,140 @@ def fetch_quotes_akshare(codes):
                 "prev_close": float(r["昨收"]),
             }
         return out or None
-    except Exception:
+    except Exception as e:
+        _record_err("akshare 行情", e)
         return None
+
+
+def fetch_quotes_sina(codes):
+    """新浪行情（hq.sinajs.cn，不走东财，是 Cloud 上东财被限时的备用行情源）。
+    成功返回 {code: dict}，失败返回 None。"""
+    try:
+        prefix = {"6": "sh", "0": "sz", "3": "sz", "4": "bj", "8": "bj"}
+        symbols = ",".join(prefix.get(c[0], "sz") + c for c in codes)
+        resp = requests.get(
+            f"http://hq.sinajs.cn/list={symbols}",
+            headers={"Referer": "https://finance.sina.com.cn"},
+            timeout=10,
+        )
+        if resp.status_code != 200 or not resp.text.strip():
+            return None
+        out = {}
+        for line in resp.text.strip().split("\n"):
+            if '"' not in line:
+                continue
+            sym, payload = line.split("=", 1)
+            code = sym.strip()[-6:]
+            parts = payload.strip().strip('";').split(",")
+            if len(parts) < 10:
+                continue
+            try:
+                price = float(parts[3])
+                prev = float(parts[2])
+            except ValueError:
+                continue
+            if price <= 0 or prev <= 0:
+                continue
+            out[code] = {
+                "price": price,
+                "change_pct": round((price / prev - 1) * 100, 2),
+                "volume": float(parts[8]),
+                "turnover": float(parts[9]),
+                "prev_close": prev,
+            }
+        return out or None
+    except Exception as e:
+        _record_err("新浪行情", e)
+        return None
+
+
+def _flow_dict_from_frame(ff, snapshot_date=None):
+    """由资金流 DataFrame（日期/收盘价/涨跌幅/主力净流入-净额）算出 streak 等指标。"""
+    ff = ff.sort_values("日期").reset_index(drop=True)
+    ff["日期"] = pd.to_datetime(ff["日期"])
+    net = ff["主力净流入-净额"].astype(float)
+    vals = net.tolist()
+
+    streak = 0
+    for v in reversed(vals):
+        if v > 0:
+            streak += 1
+        else:
+            break
+    cum = float(net.iloc[-streak:].sum()) / 1e8 if streak else 0.0
+    first_date = ff["日期"].iloc[-streak].strftime("%Y-%m-%d") if streak else None
+
+    outflow = 0
+    for v in reversed(vals):
+        if v < 0:
+            outflow += 1
+        else:
+            break
+
+    stall = 0
+    for v in reversed(vals):
+        if v > 0:
+            break
+        stall += 1
+    if streak > 0:
+        stall = 0
+
+    last = ff.iloc[-1]
+    return {
+        "streak_days": streak,
+        "cum_inflow": round(cum, 2),
+        "first_date": first_date,
+        "outflow_days": outflow,
+        "stall_days": stall,
+        "last_date": ff["日期"].iloc[-1].strftime("%Y-%m-%d"),
+        "last_price": float(last["收盘价"]),
+        "last_change": float(last["涨跌幅"]),
+        "flow_df": ff.tail(60).copy(),
+        "snapshot": snapshot_date is not None,
+        "snapshot_date": snapshot_date,
+    }
+
+
+def load_flow_snapshot():
+    """读仓库里随代码一起部署的资金流快照（fund_flow_snapshot.json）。
+    返回 {code: DataFrame}，文件缺失或损坏返回 {}。"""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "fund_flow_snapshot.json"), encoding="utf-8") as f:
+            snap = json.load(f)
+        out = {}
+        for code, rows in snap.get("stocks", {}).items():
+            df = pd.DataFrame(rows)
+            df = df.rename(columns={"date": "日期", "close": "收盘价",
+                                    "change_pct": "涨跌幅",
+                                    "main_net_inflow": "主力净流入-净额"})
+            out[code] = df
+        out["_as_of"] = snap.get("as_of")
+        return out
+    except Exception as e:
+        _record_err("快照读取", e)
+        return {}
 
 
 def fetch_fund_flow(code):
     """akshare 个股资金流（近约 100 个交易日，东财口径）。
+    失败时改用仓库快照（真实数据，截至快照日期）；快照也没有才返回 None。
     返回 dict：streak_days / cum_inflow（亿）/ first_date / outflow_days /
-    stall_days / last_date / last_price / last_change / flow_df（近 60 日）。失败返回 None。"""
+    stall_days / last_date / last_price / last_change / flow_df（近 60 日）
+    / snapshot / snapshot_date。"""
     try:
         import akshare as ak
         ff = ak.stock_fund_flow_individual_hist_em(symbol=code, market=market_of(code))
-        if ff is None or ff.empty:
-            return None
-        ff = ff.sort_values("日期").reset_index(drop=True)
-        ff["日期"] = pd.to_datetime(ff["日期"])
-        net = ff["主力净流入-净额"].astype(float)
-        vals = net.tolist()
-
-        streak = 0
-        for v in reversed(vals):
-            if v > 0:
-                streak += 1
-            else:
-                break
-        cum = float(net.iloc[-streak:].sum()) / 1e8 if streak else 0.0
-        first_date = ff["日期"].iloc[-streak].strftime("%Y-%m-%d") if streak else None
-
-        outflow = 0
-        for v in reversed(vals):
-            if v < 0:
-                outflow += 1
-            else:
-                break
-
-        # 流入停滞天数：距上一次净流入日有几个交易日
-        stall = 0
-        for v in reversed(vals):
-            if v > 0:
-                break
-            stall += 1
-        if streak > 0:
-            stall = 0
-
-        last = ff.iloc[-1]
-        return {
-            "streak_days": streak,
-            "cum_inflow": round(cum, 2),
-            "first_date": first_date,
-            "outflow_days": outflow,
-            "stall_days": stall,
-            "last_date": ff["日期"].iloc[-1].strftime("%Y-%m-%d"),
-            "last_price": float(last["收盘价"]),
-            "last_change": float(last["涨跌幅"]),
-            "flow_df": ff.tail(60).copy(),
-        }
-    except Exception:
-        return None
+        if ff is not None and not ff.empty:
+            return _flow_dict_from_frame(ff)
+        _record_err(f"资金流 {code}", Exception("akshare 返回空数据"))
+    except Exception as e:
+        _record_err(f"资金流 {code}", e)
+    snap = load_flow_snapshot()
+    df = snap.get(code)
+    if df is not None and not df.empty:
+        return _flow_dict_from_frame(df, snapshot_date=snap.get("_as_of"))
+    return None
 
 
 def fetch_history(code, days=120):
@@ -222,7 +313,8 @@ def fetch_history(code, days=120):
         h = h.sort_values("日期").reset_index(drop=True)
         h["日期"] = pd.to_datetime(h["日期"])
         return h
-    except Exception:
+    except Exception as e:
+        _record_err(f"K线 {code}", e)
         return None
 
 
@@ -235,7 +327,8 @@ def fetch_hs300_20d():
         if len(closes) < 22:
             return None
         return (closes.iloc[-1] / closes.iloc[-21] - 1) * 100
-    except Exception:
+    except Exception as e:
+        _record_err("沪深300", e)
         return None
 
 
@@ -280,10 +373,12 @@ def _try_twice(fn, *args, **kwargs):
 # ---------------- 总装：监控池实时数据 ----------------
 
 def build_watchlist():
-    """返回 (DataFrame, meta)。meta 含各数据源状态与更新时间。"""
+    """返回 (DataFrame, meta)。meta 含各数据源状态、更新时间与诊断错误。"""
+    _clear_errors()
     codes = [w["代码"] for w in WATCHLIST]
     meta = {"quote_source": "模拟", "flow_source": "模拟",
-            "updated": datetime.now().strftime("%Y-%m-%d %H:%M"), "mock_codes": []}
+            "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "mock_codes": [], "errors": []}
 
     quotes = fetch_quotes_hithink(codes)
     if quotes:
@@ -292,6 +387,10 @@ def build_watchlist():
         quotes = fetch_quotes_akshare(codes)
         if quotes:
             meta["quote_source"] = "akshare（东财）"
+        else:
+            quotes = fetch_quotes_sina(codes)
+            if quotes:
+                meta["quote_source"] = "新浪行情"
 
     hs300_20d = fetch_hs300_20d()
 
@@ -316,7 +415,10 @@ def build_watchlist():
             price_real = False
 
         if flow:
-            meta["flow_source"] = "akshare（东财口径）"
+            if flow.get("snapshot"):
+                meta["flow_source"] = f"快照 {flow.get('snapshot_date') or ''}（真实数据，截至快照日）"
+            else:
+                meta["flow_source"] = "akshare（东财口径）"
             streak, cum, first_date = flow["streak_days"], flow["cum_inflow"], flow["first_date"]
             outflow, stall = flow["outflow_days"], flow["stall_days"]
             flow_ok = True
@@ -370,4 +472,5 @@ def build_watchlist():
 
     df = pd.DataFrame(rows)
     meta["mock_codes"] = sorted(set(meta["mock_codes"]))
+    meta["errors"] = list(dict.fromkeys(ERRORS))
     return df, meta
