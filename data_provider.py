@@ -34,6 +34,22 @@ def _record_err(where, exc):
 def _clear_errors():
     ERRORS.clear()
 
+# ---------------- 熔断器：东财被限流时 10 分钟内不再重复尝试 ----------------
+# Cloud 共享 IP 会被东财反复限流；每次失败都重试只会拖慢页面。
+# 一旦某类接口失败就跳闸，10 分钟后自动恢复尝试。
+import time as _time
+
+_BLOCKED_UNTIL = {}
+_CIRCUIT_COOLDOWN = 600  # 秒
+
+
+def _akshare_blocked(key):
+    return _time.time() < _BLOCKED_UNTIL.get(key, 0)
+
+
+def _akshare_trip(key):
+    _BLOCKED_UNTIL[key] = _time.time() + _CIRCUIT_COOLDOWN
+
 # 监控池：代码、名称、分类、模拟兜底值（沿用原型 v0.1 的模拟数）
 WATCHLIST = [
     {"代码": "300604", "名称": "长川科技", "分类": "热门赛道+半导体", "模拟现价": 178.09,
@@ -149,6 +165,8 @@ def fetch_quotes_hithink(codes):
 
 def fetch_quotes_akshare(codes):
     """东财实时行情。成功返回 {code: dict}，失败返回 None。"""
+    if _akshare_blocked("spot"):
+        return None
     try:
         import akshare as ak
         spot = ak.stock_zh_a_spot_em()
@@ -165,6 +183,7 @@ def fetch_quotes_akshare(codes):
             }
         return out or None
     except Exception as e:
+        _akshare_trip("spot")
         _record_err("akshare 行情", e)
         return None
 
@@ -286,14 +305,16 @@ def fetch_fund_flow(code):
     返回 dict：streak_days / cum_inflow（亿）/ first_date / outflow_days /
     stall_days / last_date / last_price / last_change / flow_df（近 60 日）
     / snapshot / snapshot_date。"""
-    try:
-        import akshare as ak
-        ff = ak.stock_fund_flow_individual_hist_em(symbol=code, market=market_of(code))
-        if ff is not None and not ff.empty:
-            return _flow_dict_from_frame(ff)
-        _record_err(f"资金流 {code}", Exception("akshare 返回空数据"))
-    except Exception as e:
-        _record_err(f"资金流 {code}", e)
+    if not _akshare_blocked("flow"):
+        try:
+            import akshare as ak
+            ff = ak.stock_fund_flow_individual_hist_em(symbol=code, market=market_of(code))
+            if ff is not None and not ff.empty:
+                return _flow_dict_from_frame(ff)
+            _record_err(f"资金流 {code}", Exception("akshare 返回空数据"))
+        except Exception as e:
+            _akshare_trip("flow")
+            _record_err(f"资金流 {code}", e)
     snap = load_flow_snapshot()
     df = snap.get(code)
     if df is not None and not df.empty:
@@ -303,6 +324,8 @@ def fetch_fund_flow(code):
 
 def fetch_history(code, days=120):
     """akshare 日 K（前复权）。返回 DataFrame（日期/收盘/涨跌幅/换手率/振幅），失败返回 None。"""
+    if _akshare_blocked("hist"):
+        return None
     try:
         import akshare as ak
         end = datetime.now().strftime("%Y%m%d")
@@ -315,6 +338,7 @@ def fetch_history(code, days=120):
         h["日期"] = pd.to_datetime(h["日期"])
         return h
     except Exception as e:
+        _akshare_trip("hist")
         _record_err(f"K线 {code}", e)
         return None
 
@@ -392,12 +416,11 @@ def rel_label(rel_20d):
 
 
 def _try_twice(fn, *args, **kwargs):
-    """失败时隔 2 秒重试一次（东财接口偶发限流/超时）。"""
+    """失败时隔 2 秒重试一次（只针对偶发异常；返回 None 或熔断跳过时不重试，
+    避免限流时 9 只股逐只空等）。"""
     import time
     try:
-        out = fn(*args, **kwargs)
-        if out is not None:
-            return out
+        return fn(*args, **kwargs)
     except Exception:
         pass
     time.sleep(2)
