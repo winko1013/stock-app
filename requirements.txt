@@ -2,3 +2,5 @@ streamlit
 pandas
 numpy
 plotly
+requests
+akshare>=1.20.45
