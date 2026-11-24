@@ -250,4 +250,4 @@ elif page == "设置":
     st.success("设置已保存")
 
 st.sidebar.markdown("---")
-st.sidebar.caption("原型版本 v0.2 | 已接真实数据（同花顺行情 + akshare 资金流），失败时自动用模拟兜底")
+st.sidebar.caption("原型版本 v0.2 | 真实数据：同花顺行情（需 Key）/ 新浪 / akshare 资金流 / 快照，失败时自动用模拟兜底")
