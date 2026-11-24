@@ -4,7 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-from data_provider import build_watchlist, fetch_fund_flow, fetch_history
+from data_provider import build_watchlist, fetch_fund_flow, fetch_history, get_stock_monitor
 
 st.set_page_config(page_title="主力潜伏选股", page_icon="📈", layout="wide")
 
@@ -12,6 +12,12 @@ st.set_page_config(page_title="主力潜伏选股", page_icon="📈", layout="wi
 @st.cache_data(ttl=300)
 def load_watchlist():
     return build_watchlist()
+
+
+@st.cache_data(ttl=300)
+def _monitor(code):
+    """任意一只 A 股的监测数据（持股监测用，不限于监控池）。"""
+    return get_stock_monitor(code)
 
 df, meta = load_watchlist()
 
@@ -106,49 +112,80 @@ elif page == "持股监测":
         with st.container():
             col1, col2, col3 = st.columns([2, 2, 3])
             row = df[df["代码"] == h["代码"]]
-            if row.empty:
-                col1.write(f"**{h['代码']} {h['名称']}**（不在监控池）")
-                st.divider()
-                continue
-            current_price = float(row["现价"].values[0])
+            if not row.empty:
+                r = row.iloc[0]
+                current_price = float(r["现价"])
+                streak = int(r["持续流入天数"])
+                outflow = int(r["最近流出天数"])
+                stall = int(r["流入停滞天数"])
+                sell_ref = r["建议卖出价"]
+                flow_ok = True
+            else:
+                # 监控池外的股票：即时取监测数据（新浪行情 + 资金流）
+                m = _monitor(h["代码"])
+                if m is None:
+                    col1.write(f"**{h['代码']} {h['名称']}**")
+                    col1.write("暂取不到该股行情，请稍后刷新重试")
+                    st.divider()
+                    continue
+                current_price = m["price"]
+                streak = m["streak_days"]
+                outflow = m["outflow_days"]
+                stall = m["stall_days"]
+                sell_ref = m["sell"]
+                flow_ok = m["flow_ok"]
             profit = (current_price - h["成本价"]) / h["成本价"] * 100
-            streak = int(row["持续流入天数"].values[0])
-            outflow = int(row["最近流出天数"].values[0])
-            stall = int(row["流入停滞天数"].values[0])
-            sell_ref = row["建议卖出价"].values[0]
 
             col1.write(f"**{h['代码']} {h['名称']}**")
             col1.write(f"成本：{h['成本价']} | 现价：{current_price}")
             col1.write(f"盈亏：{profit:.1f}%")
 
-            col2.write(f"持续流入：{streak}天")
-            col2.write(f"最近流出：{outflow}天 | 停滞：{stall}天")
+            if flow_ok:
+                col2.write(f"持续流入：{streak}天")
+                col2.write(f"最近流出：{outflow}天 | 停滞：{stall}天")
+            else:
+                col2.write(f"持续流入：{streak}天")
+                col2.write("资金流暂取不到，只看价格")
 
             # 卖出判断
-            if outflow >= st.session_state.outflow_days_alert:
+            if flow_ok and outflow >= st.session_state.outflow_days_alert:
                 col3.error("⚠️ 重要卖出提示")
                 col3.write("主力资金已连续流出，建议减仓/清仓")
                 col3.write(f"参考卖出价：{sell_ref}")
-            elif stall >= st.session_state.stall_days_alert:
+            elif flow_ok and stall >= st.session_state.stall_days_alert:
                 col3.warning("⚠️ 流入停滞提示")
                 col3.write(f"主力资金已停滞流入 {stall} 天，留意是否转弱")
                 col3.write(f"参考卖出价：{sell_ref}")
-            else:
+            elif flow_ok:
                 col3.success("✓ 资金仍在流入，继续持有")
+            else:
+                col3.info("资金流暂取不到，暂无卖出提示")
 
             st.divider()
 
-    # 添加持仓
+    # 添加持仓（任意 A 股，不限于监控池）
     with st.expander("➕ 添加持仓"):
-        code = st.text_input("股票代码")
+        code = st.text_input("股票代码", placeholder="例如 301568")
         cost = st.number_input("成本价", min_value=0.0, value=50.0)
         qty = st.number_input("数量", min_value=100, value=1000, step=100)
         if st.button("确认添加"):
-            name = df[df["代码"] == code]["名称"].values[0] if code in df["代码"].values else "未知"
-            st.session_state.holdings.append({
-                "代码": code, "名称": name, "成本价": cost, "数量": qty,
-            })
-            st.success("已添加！请刷新页面查看")
+            code = code.strip()
+            if not (code.isdigit() and len(code) == 6):
+                st.error("请输入 6 位股票代码，例如 301568")
+            elif any(x["代码"] == code for x in st.session_state.holdings):
+                st.warning("该股票已在持仓列表中")
+            else:
+                name = None
+                if code in df["代码"].values:
+                    name = df[df["代码"] == code]["名称"].values[0]
+                else:
+                    m = _monitor(code)
+                    name = m.get("name") if m else None
+                st.session_state.holdings.append({
+                    "代码": code, "名称": name or "未知",
+                    "成本价": cost, "数量": qty,
+                })
+                st.rerun()
 
 # ==================== 个股详情 ====================
 elif page == "个股详情":

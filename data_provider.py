@@ -199,6 +199,7 @@ def fetch_quotes_sina(codes):
             if price <= 0 or prev <= 0:
                 continue
             out[code] = {
+                "name": parts[0],
                 "price": price,
                 "change_pct": round((price / prev - 1) * 100, 2),
                 "volume": float(parts[8]),
@@ -330,6 +331,42 @@ def fetch_hs300_20d():
     except Exception as e:
         _record_err("沪深300", e)
         return None
+
+
+def get_stock_monitor(code):
+    """为任意一只 A 股取监测数据（持股监测用，不限于 9 只监控池）。
+    返回 dict：name / price / change_pct / streak_days / cum_inflow /
+    first_date / outflow_days / stall_days / sell / flow_ok；
+    行情和资金流都取不到时返回 None。"""
+    flow = fetch_fund_flow(code)
+    hist = fetch_history(code)
+    quotes = fetch_quotes_sina([code])
+    q = (quotes or {}).get(code)
+    name = (q or {}).get("name")
+    if q and q.get("price"):
+        price, change_pct = q["price"], q.get("change_pct", 0.0)
+    elif flow:
+        price, change_pct = flow["last_price"], flow["last_change"]
+    else:
+        return None
+    if flow:
+        streak, cum = flow["streak_days"], flow["cum_inflow"]
+        first_date, outflow, stall = flow["first_date"], flow["outflow_days"], flow["stall_days"]
+        flow_ok = True
+    else:
+        streak, cum, first_date, outflow, stall = 0, 0.0, None, 0, 0
+        flow_ok = False
+    hi60 = None
+    if hist is not None and len(hist) >= 25:
+        hi60 = float(hist["最高"].astype(float).tail(60).max())
+    sell = (f"{hi60 * 0.95:.0f}-{hi60 * 1.05:.0f}" if hi60
+            else f"{price * 1.15:.0f}-{price * 1.35:.0f}")
+    return {
+        "name": name, "price": round(price, 2), "change_pct": round(change_pct, 2),
+        "streak_days": streak, "cum_inflow": cum, "first_date": first_date,
+        "outflow_days": outflow, "stall_days": stall, "sell": sell,
+        "flow_ok": flow_ok,
+    }
 
 
 # ---------------- 评分（公式透明，见界面「评分说明」） ----------------
