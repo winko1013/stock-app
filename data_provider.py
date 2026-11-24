@@ -301,10 +301,19 @@ def load_flow_snapshot():
 
 def fetch_fund_flow(code):
     """akshare 个股资金流（近约 100 个交易日，东财口径）。
-    失败时改用仓库快照（真实数据，截至快照日期）；快照也没有才返回 None。
+    快照优先：仓库快照够新（最新数据 3 天内）就直接用，不碰东财——
+    Cloud 上东财长期被限流，每次尝试都要等很久；日线资金流收盘后才更新，
+    快照已是最新的收盘数据。快照太旧或没有时才试 akshare（带熔断），
+    再不行才用旧快照；都没有才返回 None。
     返回 dict：streak_days / cum_inflow（亿）/ first_date / outflow_days /
     stall_days / last_date / last_price / last_change / flow_df（近 60 日）
     / snapshot / snapshot_date。"""
+    snap = load_flow_snapshot()
+    df = snap.get(code)
+    if df is not None and not df.empty:
+        last_date = pd.to_datetime(df["日期"]).max()
+        if (datetime.now() - last_date).days <= 3:
+            return _flow_dict_from_frame(df, snapshot_date=snap.get("_as_of"))
     if not _akshare_blocked("flow"):
         try:
             import akshare as ak
@@ -315,8 +324,6 @@ def fetch_fund_flow(code):
         except Exception as e:
             _akshare_trip("flow")
             _record_err(f"资金流 {code}", e)
-    snap = load_flow_snapshot()
-    df = snap.get(code)
     if df is not None and not df.empty:
         return _flow_dict_from_frame(df, snapshot_date=snap.get("_as_of"))
     return None
@@ -344,7 +351,21 @@ def fetch_history(code, days=120):
 
 
 def fetch_hs300_20d():
-    """沪深 300 近 20 个交易日涨幅（%）。失败返回 None。"""
+    """沪深 300 近 20 个交易日涨幅（%）。先走新浪 K 线直连（快，Cloud 上可用），
+    失败再走 akshare；都失败返回 None。"""
+    try:
+        resp = requests.get(
+            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+            "CN_MarketData.getKLineData",
+            params={"symbol": "sh000300", "scale": "240", "ma": "no", "datalen": "30"},
+            timeout=10,
+        )
+        data = resp.json()
+        closes = [float(d["close"]) for d in data]
+        if len(closes) >= 21:
+            return (closes[-1] / closes[-21] - 1) * 100
+    except Exception as e:
+        _record_err("沪深300（新浪）", e)
     try:
         import akshare as ak
         idx = ak.index_zh_daily_sina(symbol="sh000300")
@@ -363,7 +384,8 @@ def get_stock_monitor(code):
     first_date / outflow_days / stall_days / sell / flow_ok；
     行情和资金流都取不到时返回 None。"""
     flow = fetch_fund_flow(code)
-    hist = fetch_history(code)
+    # 资金流走快照时 K 线也不用试（Cloud 上必失败）；卖出价改用现价推算
+    hist = None if (flow and flow.get("snapshot")) else fetch_history(code)
     quotes = fetch_quotes_sina([code])
     q = (quotes or {}).get(code)
     name = (q or {}).get("name")
@@ -415,21 +437,6 @@ def rel_label(rel_20d):
     return "同步大盘"
 
 
-def _try_twice(fn, *args, **kwargs):
-    """失败时隔 2 秒重试一次（只针对偶发异常；返回 None 或熔断跳过时不重试，
-    避免限流时 9 只股逐只空等）。"""
-    import time
-    try:
-        return fn(*args, **kwargs)
-    except Exception:
-        pass
-    time.sleep(2)
-    try:
-        return fn(*args, **kwargs)
-    except Exception:
-        return None
-
-
 # ---------------- 总装：监控池实时数据 ----------------
 
 def build_watchlist():
@@ -440,25 +447,27 @@ def build_watchlist():
             "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "mock_codes": [], "errors": []}
 
+    # 行情：同花顺官方（有 Key 时）→ 新浪（快，Cloud 可用）→ akshare 东财
     quotes = fetch_quotes_hithink(codes)
     if quotes:
         meta["quote_source"] = "同花顺 Financial-API"
     else:
-        quotes = fetch_quotes_akshare(codes)
+        quotes = fetch_quotes_sina(codes)
         if quotes:
-            meta["quote_source"] = "akshare（东财）"
+            meta["quote_source"] = "新浪行情"
         else:
-            quotes = fetch_quotes_sina(codes)
+            quotes = fetch_quotes_akshare(codes)
             if quotes:
-                meta["quote_source"] = "新浪行情"
+                meta["quote_source"] = "akshare（东财）"
 
     hs300_20d = fetch_hs300_20d()
 
     rows = []
     for w in WATCHLIST:
         code = w["代码"]
-        flow = _try_twice(fetch_fund_flow, code)
-        hist = _try_twice(fetch_history, code)
+        flow = fetch_fund_flow(code)
+        # 资金流走快照时 K 线也不用试（Cloud 上必失败）
+        hist = None if (flow and flow.get("snapshot")) else fetch_history(code)
         q = (quotes or {}).get(code)
 
         # 现价：官方/东财行情优先，否则用资金流最新收盘价，最后模拟
@@ -498,6 +507,13 @@ def build_watchlist():
             avg_turn = float(hist["换手率"].astype(float).tail(20).mean())
             avg_amp = float(hist["振幅"].astype(float).tail(20).mean())
             hi60 = float(hist["最高"].astype(float).tail(60).max())
+        elif flow is not None:
+            # K 线取不到时用资金流里的 60 日收盘价算 20 日相对大盘与均线
+            closes = flow["flow_df"]["收盘价"].astype(float)
+            if len(closes) >= 21:
+                ret20 = (closes.iloc[-1] / closes.iloc[-21] - 1) * 100
+                rel_20d = ret20 - hs300_20d if hs300_20d is not None else ret20
+                above_ma20 = bool(closes.iloc[-1] > closes.tail(20).mean())
 
         if flow_ok:
             # 资金流是真的；K 线缺失时趋势/质量分用中性默认值补
