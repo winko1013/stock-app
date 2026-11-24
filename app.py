@@ -161,6 +161,11 @@ elif page == "持股监测":
             else:
                 col3.info("资金流暂取不到，暂无卖出提示")
 
+            if st.button(f"删除 {h['代码']} {h['名称']}", key=f"del_{h['代码']}"):
+                st.session_state.holdings = [
+                    x for x in st.session_state.holdings if x["代码"] != h["代码"]]
+                st.rerun()
+
             st.divider()
 
     # 添加持仓（任意 A 股，不限于监控池）
