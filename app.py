@@ -3,8 +3,36 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import json
+import os
 
 from data_provider import build_watchlist, fetch_fund_flow, fetch_history, get_stock_monitor
+
+# ==================== 持仓持久化（holdings.json，重启不丢失） ====================
+# 持仓存在 app.py 同目录的 holdings.json（只存本机，不上传 GitHub）。
+# 启动时优先读文件，无文件才用默认示例；增删持仓即时写文件。
+HOLDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holdings.json")
+
+
+def _load_holdings():
+    """读 holdings.json；无文件或损坏返回 None（用默认持仓）。"""
+    try:
+        with open(HOLDINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _save_holdings(holdings):
+    """持仓变动即写入 holdings.json。"""
+    try:
+        with open(HOLDINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(holdings, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 st.set_page_config(page_title="主力潜伏选股", page_icon="📈", layout="wide")
 
@@ -102,9 +130,10 @@ elif page == "持股监测":
     st.markdown(f"**规则**：主力资金连续≥{st.session_state.outflow_days_alert}天净流出 "
                 f"或 流入停滞≥{st.session_state.stall_days_alert}天 → 自动提示卖出")
 
-    # 模拟持仓
+    # 持仓：优先读 holdings.json（重启不丢失）；无文件用默认示例
     if "holdings" not in st.session_state:
-        st.session_state.holdings = [
+        loaded = _load_holdings()
+        st.session_state.holdings = loaded if loaded is not None else [
             {"代码": "300604", "名称": "长川科技", "成本价": 48.50, "数量": 1000},
             {"代码": "688981", "名称": "中芯国际", "成本价": 72.0, "数量": 500},
         ]
@@ -165,6 +194,7 @@ elif page == "持股监测":
             if st.button(f"删除 {h['代码']} {h['名称']}", key=f"del_{h['代码']}"):
                 st.session_state.holdings = [
                     x for x in st.session_state.holdings if x["代码"] != h["代码"]]
+                _save_holdings(st.session_state.holdings)
                 st.rerun()
 
             st.divider()
@@ -191,6 +221,7 @@ elif page == "持股监测":
                     "代码": code, "名称": name or "未知",
                     "成本价": cost, "数量": qty,
                 })
+                _save_holdings(st.session_state.holdings)
                 st.rerun()
 
 # ==================== 个股详情 ====================
