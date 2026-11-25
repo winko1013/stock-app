@@ -132,7 +132,7 @@ elif page == "分类选股":
             (df["持续流入天数"] >= min_days) &
             (df["综合分"] >= min_score)
         ]
-        if selected:
+        if selected and not result.empty:
             keywords = [CATEGORY_KEYWORDS[c] for c in selected if c in CATEGORY_KEYWORDS]
             mask = result["分类"].apply(lambda x: any(k in str(x) for k in keywords))
             result = result[mask]
