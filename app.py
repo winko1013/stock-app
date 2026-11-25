@@ -19,7 +19,8 @@ def _monitor(code):
     """任意一只 A 股的监测数据（持股监测用，不限于监控池）。"""
     return get_stock_monitor(code)
 
-df, meta = load_watchlist()
+with st.spinner("正在加载数据，请稍候…"):
+    df, meta = load_watchlist()
 
 # 卖出规则阈值（设置页可调）
 if "outflow_days_alert" not in st.session_state:

@@ -50,6 +50,33 @@ def _akshare_blocked(key):
 def _akshare_trip(key):
     _BLOCKED_UNTIL[key] = _time.time() + _CIRCUIT_COOLDOWN
 
+
+# ---------------- 超时保护：akshare 的请求没有 timeout 参数 ----------------
+# 东财接口卡住时整个页面会一直空白（Streamlit 要等脚本跑完先渲染）。
+# 把 akshare 调用放进线程，超时就当失败，返回 None 走下一级兜底。
+import threading as _threading
+
+
+def _run_with_timeout(fn, timeout):
+    """跑 fn，最多等 timeout 秒；返回 (结果, 是否超时)。
+    fn 入面抛出的异常会原样再抛，等调用方按原有逻辑记录。"""
+    box = {}
+
+    def _target():
+        try:
+            box["v"] = fn()
+        except Exception as e:
+            box["e"] = e
+
+    t = _threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return None, True
+    if "e" in box:
+        raise box["e"]
+    return box.get("v"), False
+
 # 监控池：代码、名称、分类、模拟兜底值（沿用原型 v0.1 的模拟数）
 WATCHLIST = [
     {"代码": "300604", "名称": "长川科技", "分类": "热门赛道+半导体", "模拟现价": 178.09,
@@ -167,7 +194,8 @@ def fetch_quotes_akshare(codes):
     """东财实时行情。成功返回 {code: dict}，失败返回 None。"""
     if _akshare_blocked("spot"):
         return None
-    try:
+
+    def _fetch():
         import akshare as ak
         spot = ak.stock_zh_a_spot_em()
         spot = spot[spot["代码"].astype(str).isin(codes)]
@@ -182,6 +210,12 @@ def fetch_quotes_akshare(codes):
                 "prev_close": float(r["昨收"]),
             }
         return out or None
+
+    try:
+        out, timed_out = _run_with_timeout(_fetch, 20)
+        if timed_out:
+            raise TimeoutError("akshare 行情超时 20 秒")
+        return out
     except Exception as e:
         _akshare_trip("spot")
         _record_err("akshare 行情", e)
@@ -315,9 +349,14 @@ def fetch_fund_flow(code):
         if (datetime.now() - last_date).days <= 3:
             return _flow_dict_from_frame(df, snapshot_date=snap.get("_as_of"))
     if not _akshare_blocked("flow"):
-        try:
+        def _fetch():
             import akshare as ak
-            ff = ak.stock_fund_flow_individual_hist_em(symbol=code, market=market_of(code))
+            return ak.stock_fund_flow_individual_hist_em(symbol=code, market=market_of(code))
+
+        try:
+            ff, timed_out = _run_with_timeout(_fetch, 25)
+            if timed_out:
+                raise TimeoutError("akshare 资金流超时 25 秒")
             if ff is not None and not ff.empty:
                 return _flow_dict_from_frame(ff)
             _record_err(f"资金流 {code}", Exception("akshare 返回空数据"))
@@ -333,12 +372,17 @@ def fetch_history(code, days=120):
     """akshare 日 K（前复权）。返回 DataFrame（日期/收盘/涨跌幅/换手率/振幅），失败返回 None。"""
     if _akshare_blocked("hist"):
         return None
-    try:
+    def _fetch():
         import akshare as ak
         end = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=days + 90)).strftime("%Y%m%d")
-        h = ak.stock_zh_a_hist_em(symbol=code, period="daily",
-                                  start_date=start, end_date=end, adjust="qfq")
+        return ak.stock_zh_a_hist_em(symbol=code, period="daily",
+                                     start_date=start, end_date=end, adjust="qfq")
+
+    try:
+        h, timed_out = _run_with_timeout(_fetch, 25)
+        if timed_out:
+            raise TimeoutError("akshare K线超时 25 秒")
         if h is None or h.empty:
             return None
         h = h.sort_values("日期").reset_index(drop=True)
@@ -366,9 +410,14 @@ def fetch_hs300_20d():
             return (closes[-1] / closes[-21] - 1) * 100
     except Exception as e:
         _record_err("沪深300（新浪）", e)
-    try:
+    def _fetch():
         import akshare as ak
-        idx = ak.index_zh_daily_sina(symbol="sh000300")
+        return ak.index_zh_daily_sina(symbol="sh000300")
+
+    try:
+        idx, timed_out = _run_with_timeout(_fetch, 15)
+        if timed_out:
+            raise TimeoutError("akshare 沪深300超时 15 秒")
         closes = idx["close"].astype(float).reset_index(drop=True)
         if len(closes) < 22:
             return None
