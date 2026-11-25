@@ -109,20 +109,41 @@ elif page == "分类选股":
     categories = ["热门赛道", "稳健分红", "大市值蓝筹", "小市值成长", "半导体制造",
                   "消费必需", "新能源", "医药生物", "周期金融"]
 
+    # 分类关键词映射：多选项 -> 数据「分类」栏中的关键词（子串匹配）
+    CATEGORY_KEYWORDS = {
+        "热门赛道": "热门赛道",
+        "半导体制造": "半导体",
+        "大市值蓝筹": "大市值蓝筹",
+        "新能源": "新能源",
+        "周期金融": "周期金融",
+        "消费必需": "消费",
+        "稳健分红": "分红",
+        "小市值成长": "小市值",
+        "医药生物": "医药",
+    }
+
     selected = st.multiselect("选择分类（可多选）", categories, default=["热门赛道", "半导体制造"])
 
-    min_days = st.slider("最低持续流入天数", 5, 60, 20)
-    min_score = st.slider("最低综合分", 60, 95, 75)
+    min_days = st.slider("最低持续流入天数", 1, 60, 1)
+    min_score = st.slider("最低综合分", 50, 95, 55)
 
     if st.button("开始选股", type="primary"):
         result = df[
             (df["持续流入天数"] >= min_days) &
             (df["综合分"] >= min_score)
-        ].sort_values("综合分", ascending=False)
+        ]
+        if selected:
+            keywords = [CATEGORY_KEYWORDS[c] for c in selected if c in CATEGORY_KEYWORDS]
+            mask = result["分类"].apply(lambda x: any(k in str(x) for k in keywords))
+            result = result[mask]
+        result = result.sort_values("综合分", ascending=False)
 
-        st.success(f"共找到 {len(result)} 只符合条件的股票")
-        st.dataframe(result[["代码", "名称", "综合分", "持续流入天数", "相对大盘", "建议卖出价", "分类"]],
-                     width="stretch")
+        if result.empty:
+            st.warning("没有符合条件的股票，试下放宽分类或拉低两个滑杆")
+        else:
+            st.success(f"共找到 {len(result)} 只符合条件的股票")
+            st.dataframe(result[["代码", "名称", "综合分", "持续流入天数", "相对大盘", "建议卖出价", "分类"]],
+                         width="stretch")
 
 # ==================== 持股监测（核心功能） ====================
 elif page == "持股监测":
