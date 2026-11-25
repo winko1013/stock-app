@@ -124,7 +124,7 @@ elif page == "分类选股":
 
     selected = st.multiselect("选择分类（可多选）", categories, default=["热门赛道", "半导体制造"])
 
-    min_days = st.slider("最低持续流入天数", 1, 60, 1)
+    min_days = st.slider("最低持续流入天数（0 表示不限）", 0, 60, 1)
     min_score = st.slider("最低综合分", 50, 95, 55)
 
     if st.button("开始选股", type="primary"):
