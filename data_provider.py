@@ -639,3 +639,78 @@ def build_watchlist():
     meta["mock_codes"] = sorted(set(meta["mock_codes"]))
     meta["errors"] = list(dict.fromkeys(ERRORS))
     return df, meta
+
+
+def fetch_market_index():
+    """新浪大盘指数实时行情（上证/深证成指/创业板/沪深300）。
+    s_ 指数串格式：名称,最新价,涨跌额,涨跌幅%,成交量,成交额。
+    失败返回 []。"""
+    wanted = [("s_sh000001", "上证指数"), ("s_sz399001", "深证成指"),
+              ("s_sz399006", "创业板指"), ("s_sh000300", "沪深300")]
+    try:
+        resp = requests.get(
+            "http://hq.sinajs.cn/list=" + ",".join(s for s, _ in wanted),
+            headers={"Referer": "https://finance.sina.com.cn"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+        resp.encoding = "gbk"
+        text = resp.text
+        if not text.strip():
+            return []
+        names = dict(wanted)
+        out = []
+        for line in text.strip().split("\n"):
+            if '"' not in line or "=" not in line:
+                continue
+            sym = line.split("=", 1)[0].strip().replace("var hq_str_", "")
+            if sym not in names:
+                continue
+            parts = line.split("=", 1)[1].strip().strip('";').split(",")
+            if len(parts) < 4:
+                continue
+            try:
+                out.append({"name": names[sym], "price": float(parts[1]),
+                            "change_pct": float(parts[3])})
+            except ValueError:
+                continue
+        return out
+    except Exception as e:
+        _record_err("大盘指数（新浪）", e)
+        return []
+
+
+def run_backtest(code, streak_n=3, forward_days=10):
+    """简单回测：快照资金流里，连续净流入首次达到 streak_n 天的信号日，
+    在信号日收盘买入、持有 forward_days 个交易日的涨幅统计。
+    用快照约 121 个交易日的真实收盘价与资金流；数据不足返回 None，
+    无信号返回 n=0 的 dict。"""
+    snap = load_flow_snapshot()
+    df = snap.get(code)
+    if df is None or df.empty or len(df) < 40:
+        return None
+    df = df.sort_values("日期").reset_index(drop=True)
+    net = df["主力净流入-净额"].astype(float).to_numpy()
+    close = df["收盘价"].astype(float).to_numpy()
+    dates = pd.to_datetime(df["日期"]).dt.strftime("%Y-%m-%d").tolist()
+    streak = 0
+    signals = []
+    for i, v in enumerate(net):
+        streak = streak + 1 if v > 0 else 0
+        if streak == streak_n and i + forward_days < len(close):
+            ret = (close[i + forward_days] / close[i] - 1) * 100
+            signals.append({
+                "信号日期": dates[i],
+                "信号日收盘": round(float(close[i]), 2),
+                f"{forward_days}日后收盘": round(float(close[i + forward_days]), 2),
+                f"{forward_days}日涨幅%": round(float(ret), 2),
+            })
+    if not signals:
+        return {"code": code, "n": 0, "signals": [],
+                "as_of": snap.get("_as_of"), "rows": len(df)}
+    rets = [s[f"{forward_days}日涨幅%"] for s in signals]
+    return {"code": code, "n": len(signals),
+            "win_rate": round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1),
+            "avg_ret": round(sum(rets) / len(rets), 2),
+            "signals": signals, "as_of": snap.get("_as_of"), "rows": len(df)}

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import json
 import os
 
-from data_provider import build_watchlist, fetch_fund_flow, fetch_history, get_stock_monitor
+from data_provider import build_watchlist, fetch_fund_flow, fetch_history, get_stock_monitor, fetch_market_index, run_backtest
 
 # ==================== 持仓持久化（holdings.json，重启不丢失） ====================
 # 持仓存在 app.py 同目录的 holdings.json（只存本机，不上传 GitHub）。
@@ -47,6 +47,42 @@ def _monitor(code):
     """任意一只 A 股的监测数据（持股监测用，不限于监控池）。"""
     return get_stock_monitor(code)
 
+
+@st.cache_data(ttl=300)
+def _market_index():
+    return fetch_market_index()
+
+
+@st.cache_data(ttl=300)
+def _backtest(code, streak_n, forward_days):
+    return run_backtest(code, streak_n, forward_days)
+
+
+def _beep_html():
+    """生成一段 0.5 秒 880Hz 提示音（WAV，base64 内嵌，不依赖外链）。"""
+    try:
+        import base64
+        import io
+        import math
+        import struct
+        import wave
+        rate = 8000
+        n = int(rate * 0.5)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            frames = b"".join(
+                struct.pack("<h", int(12000 * math.sin(2 * math.pi * 880 * i / rate)))
+                for i in range(n))
+            w.writeframes(frames)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return ('<audio autoplay><source src="data:audio/wav;base64,'
+                + b64 + '" type="audio/wav"></audio>')
+    except Exception:
+        return ""
+
 with st.spinner("正在加载数据，请稍候…"):
     df, meta = load_watchlist()
 
@@ -58,7 +94,7 @@ if "stall_days_alert" not in st.session_state:
 
 # ==================== 侧边栏导航 ====================
 st.sidebar.title("📈 主力潜伏选股")
-page = st.sidebar.radio("功能导航", ["首页", "分类选股", "持股监测", "个股详情", "设置"])
+page = st.sidebar.radio("功能导航", ["首页", "分类选股", "持股监测", "个股详情", "简单回测", "设置"])
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -76,6 +112,14 @@ if st.sidebar.button("🔄 刷新数据"):
 if page == "首页":
     st.title("主力潜伏选股系统")
     st.markdown("### 大盘环境：上升趋势 ✓")
+
+    idx = _market_index()
+    if idx:
+        icols = st.columns(len(idx))
+        for c, r in zip(icols, idx):
+            c.metric(r["name"], f"{r['price']:.2f}", f"{r['change_pct']:+.2f}%")
+    else:
+        st.caption("大盘指数暂取不到")
 
     inflow_n = int((df["持续流入天数"] > 0).sum())
     col1, col2, col3, col4 = st.columns(4)
@@ -159,6 +203,8 @@ elif page == "持股监测":
             {"代码": "688981", "名称": "中芯国际", "成本价": 72.0, "数量": 500},
         ]
 
+    has_alert = False
+    alert_codes = []
     for i, h in enumerate(st.session_state.holdings):
         with st.container():
             col1, col2, col3 = st.columns([2, 2, 3])
@@ -200,6 +246,8 @@ elif page == "持股监测":
 
             # 卖出判断
             if flow_ok and outflow >= st.session_state.outflow_days_alert:
+                has_alert = True
+                alert_codes.append(h["代码"])
                 col3.error("⚠️ 重要卖出提示")
                 col3.write("主力资金已连续流出，建议减仓/清仓")
                 col3.write(f"参考卖出价：{sell_ref}")
@@ -219,6 +267,13 @@ elif page == "持股监测":
                 st.rerun()
 
             st.divider()
+
+    if has_alert:
+        sig = (meta["updated"][:10], tuple(sorted(alert_codes)))
+        if st.session_state.get("_beep_sig") != sig:
+            st.session_state["_beep_sig"] = sig
+            st.markdown(_beep_html(), unsafe_allow_html=True)
+        st.caption("🔔 已触发卖出提示音（浏览器可能拦截自动播放，如无声请点一下页面再刷新；同一批提示每日只响一次）")
 
     # 添加持仓（任意 A 股，不限于监控池）
     with st.expander("➕ 添加持仓"):
@@ -308,6 +363,33 @@ elif page == "个股详情":
     st.plotly_chart(fig, width="stretch")
     if not chart_real:
         st.caption("⚠️ 资金流或 K 线暂取不到，已用模拟图表代替。")
+
+# ==================== 简单回测 ====================
+elif page == "简单回测":
+    st.title("简单回测（潜伏信号后表现）")
+    st.markdown("用快照约 121 个交易日的真实资金流与收盘价：当连续净流入首次达到 N 天，"
+                "在信号日收盘买入、持有 M 个交易日。只作历史统计，唔系买卖建议。")
+    name_map = {r["代码"]: r["名称"] for _, r in df.iterrows()}
+    for c, n in [("301568", "思泰克"), ("688362", "甬矽电子"),
+                 ("688400", "凌云光"), ("603203", "快克智能")]:
+        name_map.setdefault(c, n)
+    code = st.selectbox("选择股票", sorted(name_map),
+                        format_func=lambda x: f"{x} {name_map[x]}")
+    streak_n = st.slider("连续流入达到几天算信号", 2, 5, 3)
+    fwd = st.slider("持有多少个交易日", 5, 20, 10)
+    if st.button("开始回测", type="primary"):
+        res = _backtest(code, streak_n, fwd)
+        if res is None:
+            st.warning("该股快照数据不足，无法回测")
+        elif res["n"] == 0:
+            st.warning(f"约 {res['rows']} 个交易日里无连续流入达到 {streak_n} 天的信号")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("信号次数", str(res["n"]))
+            c2.metric("胜率", f"{res['win_rate']}%")
+            c3.metric("平均涨幅", f"{res['avg_ret']}%")
+            st.dataframe(pd.DataFrame(res["signals"]), width="stretch")
+            st.caption(f"数据截至快照日 {res['as_of']}；信号日收盘买入，持有 {fwd} 个交易日。")
 
 # ==================== 设置 ====================
 elif page == "设置":
