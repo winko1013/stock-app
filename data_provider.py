@@ -531,7 +531,15 @@ def rel_label(rel_20d):
 def build_watchlist():
     """返回 (DataFrame, meta)。meta 含各数据源状态、更新时间与诊断错误。"""
     _clear_errors()
-    codes = [w["代码"] for w in WATCHLIST]
+    # 监控池 = 默认 21 只 + 手动添加（本机 pool_additions.json，不推 GitHub）
+    pool = list(WATCHLIST)
+    _seen = {w["代码"] for w in pool}
+    for _a in load_pool_additions():
+        if _a["代码"] not in _seen:
+            pool.append({**_ADDITION_MOCK, "代码": _a["代码"],
+                         "名称": _a["名称"], "分类": _a.get("分类", "手动添加")})
+            _seen.add(_a["代码"])
+    codes = [w["代码"] for w in pool]
     meta = {"quote_source": "模拟", "flow_source": "模拟",
             "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "mock_codes": [], "errors": []}
@@ -552,7 +560,7 @@ def build_watchlist():
     hs300_20d = fetch_hs300_20d()
 
     rows = []
-    for w in WATCHLIST:
+    for w in pool:
         code = w["代码"]
         flow = fetch_fund_flow(code)
         # 资金流走快照时 K 线也不用试（Cloud 上必失败）
@@ -617,7 +625,7 @@ def build_watchlist():
                 sell = f"{price * 1.15:.0f}-{price * 1.35:.0f}"
             src = "真实"
         else:
-            latent, quality, trend = MOCK_SCORES[code]
+            latent, quality, trend = MOCK_SCORES.get(code, (50, 50, 50))
             total = round(0.4 * latent + 0.35 * trend + 0.25 * quality, 1)
             rel_txt = w["模拟相对大盘"]
             sell = w["模拟建议卖出价"]
@@ -714,3 +722,70 @@ def run_backtest(code, streak_n=3, forward_days=10):
             "win_rate": round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1),
             "avg_ret": round(sum(rets) / len(rets), 2),
             "signals": signals, "as_of": snap.get("_as_of"), "rows": len(df)}
+
+
+# ---------------- 手动添加的监控池（本机文件，不推 GitHub） ----------------
+# 同持仓一样：只存本机 app.py 同目录的 pool_additions.json，重启保留；
+# 云端加嘅重启/重新部署会冇晒。
+POOL_ADDITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "pool_additions.json")
+
+# 手动加嘅股无快照数据时嘅兜底值（现价尽量走新浪实时行情）
+_ADDITION_MOCK = {"模拟现价": 0.0, "模拟持续流入天数": 0, "模拟首次流入日期": "-",
+                  "模拟累计净流入亿": 0.0, "模拟相对大盘": "待取数", "模拟建议卖出价": "-"}
+
+
+def load_pool_additions():
+    """读 pool_additions.json（[{代码, 名称, 分类}]）；无文件或损坏返回 []。"""
+    try:
+        with open(POOL_ADDITIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [a for a in data
+                    if isinstance(a, dict) and a.get("代码")]
+    except Exception:
+        pass
+    return []
+
+
+def save_pool_additions(additions):
+    """写 pool_additions.json。"""
+    try:
+        with open(POOL_ADDITIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(additions, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def fetch_today_fund_rank(limit=50):
+    """今日主力净流入排行（akshare 东财口径，前 limit 名）。
+    东财成日限流，失败返回 None（页面显示提示，唔当错）。
+    列：代码/名称/最新价/涨跌幅%/主力净流入(亿)。"""
+    if _akshare_blocked("rank"):
+        return None
+
+    def _fetch():
+        import akshare as ak
+        fn = getattr(ak, "stock_fund_flow_individual_rank_em", None)
+        if fn is None:  # 旧版 akshare 的函数名
+            fn = ak.stock_individual_fund_flow_rank
+        return fn(indicator="今日")
+
+    try:
+        rank, timed_out = _run_with_timeout(_fetch, 25)
+        if timed_out:
+            raise TimeoutError("今日主力榜超时 25 秒")
+        if rank is None or rank.empty:
+            return None
+        need = ["代码", "名称", "最新价", "今日涨跌幅", "今日主力净流入-净额"]
+        if any(c not in rank.columns for c in need):
+            _record_err("今日主力榜", Exception(f"列名不符: {list(rank.columns)[:6]}"))
+            return None
+        out = rank[need].head(limit).copy()
+        out["今日主力净流入-净额"] = (out["今日主力净流入-净额"].astype(float) / 1e8).round(2)
+        out.columns = ["代码", "名称", "最新价", "涨跌幅%", "主力净流入(亿)"]
+        return out
+    except Exception as e:
+        _akshare_trip("rank")
+        _record_err("今日主力榜", e)
+        return None

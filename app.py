@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import json
 import os
 
-from data_provider import build_watchlist, fetch_fund_flow, fetch_history, get_stock_monitor, fetch_market_index, run_backtest
+from data_provider import build_watchlist, fetch_fund_flow, fetch_history, get_stock_monitor, fetch_market_index, run_backtest, load_pool_additions, save_pool_additions, fetch_today_fund_rank
 
 # ==================== 持仓持久化（holdings.json，重启不丢失） ====================
 # 持仓存在 app.py 同目录的 holdings.json（只存本机，不上传 GitHub）。
@@ -58,6 +58,11 @@ def _backtest(code, streak_n, forward_days):
     return run_backtest(code, streak_n, forward_days)
 
 
+@st.cache_data(ttl=600)
+def _today_rank():
+    return fetch_today_fund_rank()
+
+
 def _beep_html():
     """生成一段 0.5 秒 880Hz 提示音（WAV，base64 内嵌，不依赖外链）。"""
     try:
@@ -94,7 +99,7 @@ if "stall_days_alert" not in st.session_state:
 
 # ==================== 侧边栏导航 ====================
 st.sidebar.title("📈 主力潜伏选股")
-page = st.sidebar.radio("功能导航", ["首页", "分类选股", "持股监测", "个股详情", "简单回测", "设置"])
+page = st.sidebar.radio("功能导航", ["首页", "今日主力榜", "监控池", "分类选股", "持股监测", "个股详情", "简单回测", "设置"])
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -146,6 +151,83 @@ if page == "首页":
 
     st.info("💡 提示：点击左侧「持股监测」查看是否有资金停止流入的持仓股票")
 
+# ==================== 今日主力榜 ====================
+elif page == "今日主力榜":
+    st.title("今日主力资金净流入排行")
+    st.caption("数据：东方财富（akshare）。东财接口成日限流，取唔到时会显示提示，唔系 App 坏。")
+
+    rank_df = _today_rank()
+    if rank_df is None or rank_df.empty:
+        st.warning("暂时取不到今日排行（东财接口限流），稍后再试。手动添加监控池唔受影响。")
+    else:
+        st.dataframe(rank_df, width="stretch")
+        codes = rank_df["代码"].tolist()
+        selected = st.multiselect(
+            "勾选加入监控池", codes,
+            format_func=lambda x: f"{x} {rank_df[rank_df['代码'] == x]['名称'].values[0]}")
+        if st.button("加入监控池", type="primary") and selected:
+            adds = load_pool_additions()
+            have = {a["代码"] for a in adds} | set(df["代码"].tolist())
+            n = 0
+            for code in selected:
+                if code not in have:
+                    name = rank_df[rank_df["代码"] == code]["名称"].values[0]
+                    adds.append({"代码": code, "名称": name, "分类": "手动添加"})
+                    have.add(code)
+                    n += 1
+            save_pool_additions(adds)
+            st.cache_data.clear()
+            st.success(f"已加入 {n} 只（已存本机，重启唔会冇晒）")
+            st.rerun()
+
+# ==================== 监控池（含手动添加） ====================
+elif page == "监控池":
+    st.title(f"监控池（共 {len(df)} 只）")
+    st.caption("手动加嘅股存喺本机文件，重启唔会冇晒，唔推 GitHub；云端加嘅重启会冇晒，同持仓一样。")
+
+    adds = load_pool_additions()
+    with st.expander("➕ 手动添加股票到监控池", expanded=True):
+        c1, c2, c3 = st.columns([2, 2, 2])
+        new_code = c1.text_input("股票代码（例：688256）", key="pool_code")
+        new_name = c2.text_input("股票名称（可空，会自动查）", key="pool_name")
+        new_cat = c3.selectbox("分类", ["手动添加", "热门赛道", "半导体制造", "大市值蓝筹",
+                                        "新能源", "周期金融", "消费必需", "医药生物",
+                                        "稳健分红", "小市值成长"], key="pool_cat")
+        if st.button("添加", type="primary"):
+            code = (new_code or "").strip()
+            if not (code.isdigit() and len(code) == 6):
+                st.error("请输入 6 位股票代码，例如 688256")
+            elif code in df["代码"].values:
+                st.warning(f"{code} 已在监控池中")
+            else:
+                name = (new_name or "").strip()
+                if not name:
+                    m = _monitor(code)
+                    name = m.get("name") if m else None
+                if not name:
+                    st.error("查不到该股行情，请检查代码")
+                else:
+                    adds.append({"代码": code, "名称": name, "分类": new_cat})
+                    save_pool_additions(adds)
+                    st.cache_data.clear()
+                    st.success(f"已添加 {code} {name}（已存本机）")
+                    st.rerun()
+
+    if adds:
+        st.subheader("手动添加嘅股票")
+        for a in adds:
+            col_a, col_b = st.columns([4, 1])
+            col_a.write(f"**{a['代码']} {a['名称']}**（{a.get('分类', '手动添加')}）")
+            if col_b.button("删除", key=f"del_pool_{a['代码']}"):
+                save_pool_additions([x for x in adds if x["代码"] != a["代码"]])
+                st.cache_data.clear()
+                st.rerun()
+
+    st.divider()
+    st.subheader("监控池一览")
+    st.dataframe(df[["代码", "名称", "现价", "涨跌幅", "综合分", "持续流入天数",
+                     "累计净流入亿", "相对大盘", "数据源"]], width="stretch")
+
 # ==================== 分类选股 ====================
 elif page == "分类选股":
     st.title("分类选股")
@@ -178,7 +260,8 @@ elif page == "分类选股":
         ]
         if selected and not result.empty:
             keywords = [CATEGORY_KEYWORDS[c] for c in selected if c in CATEGORY_KEYWORDS]
-            mask = result["分类"].apply(lambda x: any(k in str(x) for k in keywords))
+            mask = result["分类"].apply(
+                lambda x: x == "手动添加" or any(k in str(x) for k in keywords))
             result = result[mask]
         result = result.sort_values("综合分", ascending=False)
 
