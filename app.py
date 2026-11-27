@@ -507,6 +507,47 @@ elif page == "设置":
     st.code('HITHINK_FINANCE_API_KEY = "你的 Key"')
     st.write("3. 保存后应用自动重启，行情即改由同花顺官方接口提供。")
     st.write("注意：资金流接口官方不对外开放，资金流继续用 akshare（东财口径）。")
+
+    st.markdown("---")
+    st.subheader("本机数据备份（持仓 + 手动监控池）")
+    st.write("导出本机持仓与手动添加的监控池股票为 JSON 文件；导入会覆盖当前文件，重启后仍然保留。")
+    _exp_holdings = _load_holdings() or []
+    _exp_pool = load_pool_additions()
+    _export_data = {"holdings": _exp_holdings, "pool_additions": _exp_pool}
+    st.download_button(
+        label="下载备份文件",
+        data=json.dumps(_export_data, ensure_ascii=False, indent=2),
+        file_name="stock_backup.json",
+        mime="application/json",
+        key="download_backup",
+    )
+    _uploaded = st.file_uploader("导入备份文件", type=["json"], key="backup_uploader")
+    if _uploaded is not None:
+        _imp_data = None
+        try:
+            _imp_data = json.load(_uploaded)
+        except Exception as _e:
+            st.error(f"导入失败：文件读不到（{_e}）")
+        if _imp_data is not None:
+            _imp_holdings = _imp_data.get("holdings")
+            _imp_pool = _imp_data.get("pool_additions")
+            _valid = (
+                isinstance(_imp_data, dict)
+                and isinstance(_imp_holdings, list)
+                and isinstance(_imp_pool, list)
+                and all(isinstance(h, dict) and h.get("代码") for h in _imp_holdings)
+                and all(isinstance(a, dict) and a.get("代码") for a in _imp_pool)
+            )
+            if not _valid:
+                st.error("导入失败：文件格式唔啱，要有 holdings 同 pool_additions 两个清单，每项要有股票代码。")
+            elif st.button("确认导入并写入文件", type="primary", key="confirm_import_backup"):
+                _save_holdings(_imp_holdings)
+                save_pool_additions(_imp_pool)
+                st.session_state.holdings = list(_imp_holdings)
+                st.cache_data.clear()
+                st.success("导入成功！数据已写入文件。")
+                st.rerun()
+
     st.success("设置已保存")
 
 st.sidebar.markdown("---")
