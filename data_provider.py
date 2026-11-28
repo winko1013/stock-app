@@ -10,8 +10,8 @@
                 不对外开放，仅在同花顺 AI 客户端内部使用）
                 → 仓库快照 fund_flow_snapshot.json（真实数据，截至快照日）
   K 线：akshare（东财，前复权）；取不到时个股详情图用资金流收盘价代替
-  新综合分参考列的 K 线：东财 push2his 直连（与 akshare 底层同一接口，前复权），
-  失败显示「—」，旧分唔受影响。
+  中线分参考列的 K 线：东财 push2his 直连（与 akshare 底层同一接口，前复权），
+  失败显示「—」，短线分唔受影响。
 全部失败时用内置模拟数据兜底，并在界面标注数据来源。
 """
 
@@ -230,14 +230,14 @@ def fetch_quotes_hithink(codes):
         return None
 
 
-# ---------------- 东财直连 K 线（只供新综合分参考列） ----------------
+# ---------------- 东财直连 K 线（只供中线分参考列） ----------------
 # akshare 的 K 线接口单只约 7 秒，27 只顺序取要几分钟，页面等唔起；
 # 直接调东财 push2his 接口（akshare 底层同一接口），一次取一只、约 0.5 秒，
-# 字段齐：成交额 / 振幅 / 换手率。失败走熔断器，新分显示「—」，旧分唔受影响。
+# 字段齐：成交额 / 振幅 / 换手率。失败走熔断器，中线分显示「—」，短线分唔受影响。
 # K 线 20 日窗口数据一日先变一次，按日缓存，同一进程内一日只取一次。
 _EM_SESSION = None
 _EM_KLINE_CACHE = {}
-_EM_FAIL_STREAK = 0  # 连续失败计数：东财直连偶有代理抖动，连续失败 2 次先跳闸，免得一次抖动拖垮成列新分
+_EM_FAIL_STREAK = 0  # 连续失败计数：东财直连偶有代理抖动，连续失败 2 次先跳闸，免得一次抖动拖垮成列中线分
 
 
 def _em_session():
@@ -367,7 +367,7 @@ def _flow_dict_from_frame(ff, snapshot_date=None):
         "outflow_days": outflow,
         "stall_days": stall,
         "last_date": ff["日期"].iloc[-1].strftime("%Y-%m-%d"),
-        "history_rows": len(ff),  # 资金流历史总行数（新分硬过滤「上市不足 60 日」用）
+        "history_rows": len(ff),  # 资金流历史总行数（中线分硬过滤「上市不足 60 日」用）
         "last_price": float(last["收盘价"]),
         "last_change": float(last["涨跌幅"]),
         "flow_df": ff.tail(60).copy(),
@@ -459,9 +459,9 @@ def fetch_history(code, days=120):
 
 
 def fetch_history_em(code, days=120):
-    """东财 push2his 直连日 K（前复权），只供新综合分参考列取数。
+    """东财 push2his 直连日 K（前复权），只供中线分参考列取数。
     返回 DataFrame（日期/开盘/收盘/最高/最低/成交量/成交额/振幅/涨跌幅/换手率，
-    与 akshare stock_zh_a_hist_em 栏名一致），失败返回 None（新分显示「—」）。
+    与 akshare stock_zh_a_hist_em 栏名一致），失败返回 None（中线分显示「—」）。
     按日缓存：同一进程内同一只股一日只取一次（盘中取数含当日未收盘 K 线，
     收盘后以次日刷新为准）；连续失败 2 次走熔断器，10 分钟内不再试。"""
     global _EM_FAIL_STREAK
@@ -605,12 +605,12 @@ def _turnover_deduct_new(avg_turnover):
 
 def compute_scores_new(inflow_days20, net_ratio, rel_20d, bias20,
                        avg_turnover, avg_amplitude):
-    """新综合分（修订精简版，仅供参考展示，不影响旧分）。
+    """中线分（修订精简版，仅供参考展示，不影响短线分）。
     潜伏分 = 近20日净流入天数×3.5 + 净流入占比(%)×12；
     趋势分 = 50 + 20日相对沪深300涨幅×2.5 − 乖离惩罚
             （BIAS20 超过 12% 的部分每 1% 扣 2 分；无均线结构分）；
     质量分 = 90 − 换手偏离扣分 − 近20日平均振幅×2。
-    调用方须保证六个输入齐全；缺失时新分显示「—」，唔好传默认值入嚟。"""
+    调用方须保证六个输入齐全；缺失时中线分显示「—」，唔好传默认值入嚟。"""
     latent = _clip(inflow_days20 * 3.5 + max(net_ratio, 0) * 12)
     penalty = max(0.0, (bias20 - 12) * 2)
     trend = _clip(50 + (rel_20d or 0) * 2.5 - penalty)
@@ -620,7 +620,7 @@ def compute_scores_new(inflow_days20, net_ratio, rel_20d, bias20,
 
 
 def tag_dual(old_total, new_total):
-    """双公式打标：旧分≥55 且 新分≥55 → ★双共振；否则空字串。"""
+    """双公式打标：短线分≥55 且 中线分≥55 → ★双共振；否则空字串。"""
     if old_total is not None and new_total is not None \
             and old_total >= 55 and new_total >= 55:
         return "★双共振"
@@ -628,9 +628,9 @@ def tag_dual(old_total, new_total):
 
 
 def _new_score_for_stock(code, name, flow, hist, rel_20d, old_total):
-    """算一只股的新综合分（修订精简版，仅供参考展示）。
-    返回 (新综合分, 辅助参考分, 打标)；缺失或触硬过滤时返回 (None, None, "")。
-    任何异常都吞掉返 None——参考列唔可以拖垮旧分同页面。"""
+    """算一只股的中线分（修订精简版，仅供参考展示）。
+    返回 (中线分, 辅助参考分, 打标)；缺失或触硬过滤时返回 (None, None, "")。
+    任何异常都吞掉返 None——参考列唔可以拖垮短线分同页面。"""
     try:
         if flow is None or rel_20d is None:
             return None, None, ""
@@ -656,7 +656,7 @@ def _new_score_for_stock(code, name, flow, hist, rel_20d, old_total):
             avg_amp = float(((kline["最高"].astype(float)
                               - kline["最低"].astype(float)) / prev * 100)
                              .tail(20).mean())
-        # 硬过滤（只适用于新分）：任一成立即显示「—」
+        # 硬过滤（只适用于中线分）：任一成立即显示「—」
         if (flow.get("history_rows", 0) < 60
                 or "ST" in (name or "")  # 名称含 ST 作近似判断
                 or int(closes.tail(20).notna().sum()) < 18
@@ -675,7 +675,7 @@ def _new_score_for_stock(code, name, flow, hist, rel_20d, old_total):
         aux_total = round(0.6 * old_total + 0.4 * new_total, 1)
         return new_total, aux_total, tag_dual(old_total, new_total)
     except Exception as e:
-        _record_err(f"新综合分 {code}", e)
+        _record_err(f"中线分 {code}", e)
         return None, None, ""
 
 
@@ -795,7 +795,7 @@ def build_watchlist():
             src = "模拟"
             meta["mock_codes"].append(code)
 
-        # 新综合分（参考展示）：旧分算完先计，唔影响旧分
+        # 中线分（参考展示）：短线分算完先计，唔影响短线分
         if flow_ok:
             new_total, aux_total, dual_tag = _new_score_for_stock(
                 code, w["名称"], flow, hist, rel_20d, total)
@@ -805,8 +805,8 @@ def build_watchlist():
         rows.append({
             "代码": code, "名称": w["名称"], "分类": w["分类"],
             "现价": round(price, 2), "涨跌幅": round(change_pct, 2),
-            "潜伏分": latent, "质量分": quality, "趋势分": trend, "综合分": total,
-            "新综合分": new_total, "辅助参考分": aux_total, "打标": dual_tag,
+            "潜伏分": latent, "质量分": quality, "趋势分": trend, "短线分": total,
+            "中线分": new_total, "辅助参考分": aux_total, "打标": dual_tag,
             "持续流入天数": streak, "首次流入日期": first_date or "-",
             "累计净流入亿": cum, "相对大盘": rel_txt,
             "相对大盘数值": round(rel_20d, 2) if rel_20d is not None else None,

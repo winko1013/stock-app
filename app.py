@@ -114,7 +114,7 @@ if st.sidebar.button("🔄 刷新数据"):
     st.rerun()
 
 def _fmt_score(x):
-    """新综合分 / 辅助参考分显示：数字保留一位小数，缺失显示 —。"""
+    """中线分 / 辅助参考分显示：数字保留一位小数，缺失显示 —。"""
     try:
         if x is None or pd.isna(x):
             return "—"
@@ -144,13 +144,13 @@ if page == "首页":
     col4.metric("行情来源", meta["quote_source"].replace("（东财）", ""))
 
     st.subheader("今日重点关注")
-    top = df.nlargest(3, "综合分")[["代码", "名称", "综合分", "持续流入天数", "相对大盘", "建议卖出价"]]
+    top = df.nlargest(3, "短线分")[["代码", "名称", "短线分", "持续流入天数", "相对大盘", "建议卖出价"]]
     st.dataframe(top, width="stretch")
 
     st.subheader("监控池一览")
-    _home = df[["代码", "名称", "现价", "涨跌幅", "综合分", "新综合分", "辅助参考分",
+    _home = df[["代码", "名称", "现价", "涨跌幅", "短线分", "中线分", "辅助参考分",
                 "打标", "持续流入天数", "累计净流入亿", "相对大盘", "数据源"]].copy()
-    _home["新综合分"] = _home["新综合分"].map(_fmt_score)
+    _home["中线分"] = _home["中线分"].map(_fmt_score)
     _home["辅助参考分"] = _home["辅助参考分"].map(_fmt_score)
     st.dataframe(_home, width="stretch")
 
@@ -158,14 +158,14 @@ if page == "首页":
         st.write("潜伏分 = 持续流入天数×6 + min(累计净流入亿, 30)×1，上限 100。")
         st.write("趋势分 = 50 + 20日相对沪深300涨幅×4，收盘站上20日均线 +8，否则 -8。")
         st.write("质量分 = 85 − |近20日平均换手率 − 4%|×6 − 近20日平均振幅×1.5。")
-        st.write("综合分 = 潜伏分×0.4 + 趋势分×0.35 + 质量分×0.25。")
-        st.write("新综合分（仅供参考）：潜伏分 = 近20日净流入天数×3.5 + 净流入占比(%)×12；"
+        st.write("短线分 = 潜伏分×0.4 + 趋势分×0.35 + 质量分×0.25。")
+        st.write("中线分（仅供参考）：潜伏分 = 近20日净流入天数×3.5 + 净流入占比(%)×12；"
                  "趋势分 = 50 + 20日相对沪深300涨幅×2.5 − 乖离惩罚（BIAS20 超过 12% 的部分每 1% 扣 2 分）；"
                  "质量分 = 90 − 换手偏离扣分 − 近20日平均振幅×2（换手率 2%~6% 扣 0，低于 2% 每低 1% 扣 6 分，高于 6% 每高 1% 扣 4 分）。")
-        st.write("辅助参考分 = 0.6×旧综合分 + 0.4×新综合分。打标：旧分≥55 且 新分≥55 → ★双共振。")
-        st.write("新综合分硬过滤：上市不足 60 个交易日、ST 股、近 20 日有效交易日不足 18 天、"
+        st.write("辅助参考分 = 0.6×短线分 + 0.4×中线分。打标：短线分≥55 且 中线分≥55 → ★双共振。")
+        st.write("中线分硬过滤：上市不足 60 个交易日、ST 股、近 20 日有效交易日不足 18 天、"
                  "近 20 日日均成交额低于 1.5 亿、近 20 日出现过单日跌幅大于 9%，或数据缺失时显示「—」。")
-        st.write("新综合分仅供参考，未验证有效；排序与筛选以旧综合分为准。")
+        st.write("中线分仅供参考，未验证有效；排序与筛选以短线分为准。")
         st.write("建议卖出价 = 近60日最高价附近 ±5%，仅供参考。")
         st.write("资金流为东财口径主力净流入；同花顺官方 API 不对外开放资金流接口。")
 
@@ -245,9 +245,9 @@ elif page == "监控池":
 
     st.divider()
     st.subheader("监控池一览")
-    _pool = df[["代码", "名称", "现价", "涨跌幅", "综合分", "新综合分", "辅助参考分",
+    _pool = df[["代码", "名称", "现价", "涨跌幅", "短线分", "中线分", "辅助参考分",
                 "打标", "持续流入天数", "累计净流入亿", "相对大盘", "数据源"]].copy()
-    _pool["新综合分"] = _pool["新综合分"].map(_fmt_score)
+    _pool["中线分"] = _pool["中线分"].map(_fmt_score)
     _pool["辅助参考分"] = _pool["辅助参考分"].map(_fmt_score)
     st.dataframe(_pool, width="stretch")
 
@@ -274,27 +274,27 @@ elif page == "分类选股":
     selected = st.multiselect("选择分类（可多选）", categories, default=["热门赛道", "半导体制造"])
 
     min_days = st.slider("最低持续流入天数（0 表示不限）", 0, 60, 1)
-    min_score = st.slider("最低综合分", 50, 95, 55)
+    min_score = st.slider("最低短线分", 50, 95, 55)
 
     if st.button("开始选股", type="primary"):
         result = df[
             (df["持续流入天数"] >= min_days) &
-            (df["综合分"] >= min_score)
+            (df["短线分"] >= min_score)
         ]
         if selected and not result.empty:
             keywords = [CATEGORY_KEYWORDS[c] for c in selected if c in CATEGORY_KEYWORDS]
             mask = result["分类"].apply(
                 lambda x: x == "手动添加" or any(k in str(x) for k in keywords))
             result = result[mask]
-        result = result.sort_values("综合分", ascending=False)
+        result = result.sort_values("短线分", ascending=False)
 
         if result.empty:
             st.warning("没有符合条件的股票，试下放宽分类或拉低两个滑杆")
         else:
             st.success(f"共找到 {len(result)} 只符合条件的股票")
-            _res = result[["代码", "名称", "综合分", "新综合分", "辅助参考分", "打标",
+            _res = result[["代码", "名称", "短线分", "中线分", "辅助参考分", "打标",
                            "持续流入天数", "相对大盘", "建议卖出价", "分类"]].copy()
-            _res["新综合分"] = _res["新综合分"].map(_fmt_score)
+            _res["中线分"] = _res["中线分"].map(_fmt_score)
             _res["辅助参考分"] = _res["辅助参考分"].map(_fmt_score)
             st.dataframe(_res, width="stretch")
 
@@ -419,11 +419,11 @@ elif page == "个股详情":
 
     col1, col2, col3 = st.columns(3)
     col1.metric("现价", stock["现价"], f"{stock['涨跌幅']}%")
-    col2.metric("综合分", stock["综合分"])
+    col2.metric("短线分", stock["短线分"])
     col3.metric("持续流入天数", stock["持续流入天数"])
 
     _tag = f"  {stock['打标']}" if stock["打标"] else ""
-    st.write(f"新综合分（仅供参考）：{_fmt_score(stock['新综合分'])}{_tag}"
+    st.write(f"中线分（仅供参考）：{_fmt_score(stock['中线分'])}{_tag}"
              f"  ｜  辅助参考分：{_fmt_score(stock['辅助参考分'])}")
 
     st.subheader("主力资金潜伏监测")
