@@ -10,6 +10,8 @@
                 不对外开放，仅在同花顺 AI 客户端内部使用）
                 → 仓库快照 fund_flow_snapshot.json（真实数据，截至快照日）
   K 线：akshare（东财，前复权）；取不到时个股详情图用资金流收盘价代替
+  新综合分参考列的 K 线：东财 push2his 直连（与 akshare 底层同一接口，前复权），
+  失败显示「—」，旧分唔受影响。
 全部失败时用内置模拟数据兜底，并在界面标注数据来源。
 """
 
@@ -228,6 +230,27 @@ def fetch_quotes_hithink(codes):
         return None
 
 
+# ---------------- 东财直连 K 线（只供新综合分参考列） ----------------
+# akshare 的 K 线接口单只约 7 秒，27 只顺序取要几分钟，页面等唔起；
+# 直接调东财 push2his 接口（akshare 底层同一接口），一次取一只、约 0.5 秒，
+# 字段齐：成交额 / 振幅 / 换手率。失败走熔断器，新分显示「—」，旧分唔受影响。
+# K 线 20 日窗口数据一日先变一次，按日缓存，同一进程内一日只取一次。
+_EM_SESSION = None
+_EM_KLINE_CACHE = {}
+_EM_FAIL_STREAK = 0  # 连续失败计数：东财直连偶有代理抖动，连续失败 2 次先跳闸，免得一次抖动拖垮成列新分
+
+
+def _em_session():
+    global _EM_SESSION
+    if _EM_SESSION is None:
+        _EM_SESSION = requests.Session()
+        _EM_SESSION.headers.update({
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        })
+    return _EM_SESSION
+
+
 # ---------------- akshare：行情 / 资金流 / K 线 ----------------
 
 def fetch_quotes_akshare(codes):
@@ -344,6 +367,7 @@ def _flow_dict_from_frame(ff, snapshot_date=None):
         "outflow_days": outflow,
         "stall_days": stall,
         "last_date": ff["日期"].iloc[-1].strftime("%Y-%m-%d"),
+        "history_rows": len(ff),  # 资金流历史总行数（新分硬过滤「上市不足 60 日」用）
         "last_price": float(last["收盘价"]),
         "last_change": float(last["涨跌幅"]),
         "flow_df": ff.tail(60).copy(),
@@ -434,6 +458,59 @@ def fetch_history(code, days=120):
         return None
 
 
+def fetch_history_em(code, days=120):
+    """东财 push2his 直连日 K（前复权），只供新综合分参考列取数。
+    返回 DataFrame（日期/开盘/收盘/最高/最低/成交量/成交额/振幅/涨跌幅/换手率，
+    与 akshare stock_zh_a_hist_em 栏名一致），失败返回 None（新分显示「—」）。
+    按日缓存：同一进程内同一只股一日只取一次（盘中取数含当日未收盘 K 线，
+    收盘后以次日刷新为准）；连续失败 2 次走熔断器，10 分钟内不再试。"""
+    global _EM_FAIL_STREAK
+    today = datetime.now().strftime("%Y-%m-%d")
+    hit = _EM_KLINE_CACHE.get(code)
+    if hit and hit[0] == today:
+        return hit[1]
+    if _akshare_blocked("em_kline"):
+        return None
+    try:
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+        secid = ("1." if code.startswith("6") else "0.") + code
+        resp = _em_session().get(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={"secid": secid, "klt": "101", "fqt": "1",
+                    "beg": start, "end": end,
+                    "fields1": "f1,f2,f3,f4,f5",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"},
+            timeout=8,
+        )
+        payload = resp.json()
+        klines = (payload.get("data") or {}).get("klines") or []
+        if payload.get("rc") != 0 or not klines:
+            raise ValueError(f"东财 K 线无数据 (rc={payload.get('rc')})")
+        rows = []
+        for k in klines:
+            # 顺序：日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+            p = k.split(",")
+            rows.append({
+                "日期": pd.to_datetime(p[0]),
+                "开盘": float(p[1]), "收盘": float(p[2]),
+                "最高": float(p[3]), "最低": float(p[4]),
+                "成交量": float(p[5]), "成交额": float(p[6]),
+                "振幅": float(p[7]), "涨跌幅": float(p[8]),
+                "换手率": float(p[10]),
+            })
+        df = pd.DataFrame(rows).sort_values("日期").reset_index(drop=True)
+        _EM_FAIL_STREAK = 0
+        _EM_KLINE_CACHE[code] = (today, df)
+        return df
+    except Exception as e:
+        _EM_FAIL_STREAK += 1
+        if _EM_FAIL_STREAK >= 2:
+            _akshare_trip("em_kline")
+        _record_err(f"东财直连 K 线 {code}", e)
+        return None
+
+
 def fetch_hs300_20d():
     """沪深 300 近 20 个交易日涨幅（%）。先走新浪 K 线直连（快，Cloud 上可用），
     失败再走 akshare；都失败返回 None。"""
@@ -514,6 +591,92 @@ def compute_scores(streak_days, cum_inflow, rel_20d, above_ma20,
     quality = _clip(85 - abs((avg_turnover or 4) - 4) * 6 - (avg_amplitude or 0) * 1.5)
     total = round(0.4 * latent + 0.35 * trend + 0.25 * quality, 1)
     return latent, quality, trend, total
+
+
+def _turnover_deduct_new(avg_turnover):
+    """新公式质量分换手偏离扣分：2%~6% 扣 0；低于 2% 按 (2-换手率)×6 扣；
+    高于 6% 按 (换手率-6)×4 扣。"""
+    if 2.0 <= avg_turnover <= 6.0:
+        return 0.0
+    if avg_turnover < 2.0:
+        return (2.0 - avg_turnover) * 6
+    return (avg_turnover - 6.0) * 4
+
+
+def compute_scores_new(inflow_days20, net_ratio, rel_20d, bias20,
+                       avg_turnover, avg_amplitude):
+    """新综合分（修订精简版，仅供参考展示，不影响旧分）。
+    潜伏分 = 近20日净流入天数×3.5 + 净流入占比(%)×12；
+    趋势分 = 50 + 20日相对沪深300涨幅×2.5 − 乖离惩罚
+            （BIAS20 超过 12% 的部分每 1% 扣 2 分；无均线结构分）；
+    质量分 = 90 − 换手偏离扣分 − 近20日平均振幅×2。
+    调用方须保证六个输入齐全；缺失时新分显示「—」，唔好传默认值入嚟。"""
+    latent = _clip(inflow_days20 * 3.5 + max(net_ratio, 0) * 12)
+    penalty = max(0.0, (bias20 - 12) * 2)
+    trend = _clip(50 + (rel_20d or 0) * 2.5 - penalty)
+    quality = _clip(90 - _turnover_deduct_new(avg_turnover) - avg_amplitude * 2)
+    total = round(0.4 * latent + 0.35 * trend + 0.25 * quality, 1)
+    return latent, quality, trend, total
+
+
+def tag_dual(old_total, new_total):
+    """双公式打标：旧分≥55 且 新分≥55 → ★双共振；否则空字串。"""
+    if old_total is not None and new_total is not None \
+            and old_total >= 55 and new_total >= 55:
+        return "★双共振"
+    return ""
+
+
+def _new_score_for_stock(code, name, flow, hist, rel_20d, old_total):
+    """算一只股的新综合分（修订精简版，仅供参考展示）。
+    返回 (新综合分, 辅助参考分, 打标)；缺失或触硬过滤时返回 (None, None, "")。
+    任何异常都吞掉返 None——参考列唔可以拖垮旧分同页面。"""
+    try:
+        if flow is None or rel_20d is None:
+            return None, None, ""
+        # K 线：优先用已有的 hist（实时资金流路径），否则试东财直连
+        kline = hist
+        if kline is None:
+            kline = fetch_history_em(code)
+        fdf = flow.get("flow_df")
+        if kline is None or fdf is None or len(kline) < 25 or len(fdf) < 20:
+            return None, None, ""
+        closes = kline["收盘"].astype(float)
+        chg20 = kline["涨跌幅"].astype(float).tail(20)
+        if "成交额" in kline.columns:
+            amount20 = float(kline["成交额"].astype(float).tail(20).sum())
+        else:
+            # K 线源无成交额字段时，用收盘价×成交量估算
+            amount20 = float((kline["收盘"].astype(float)
+                              * kline["成交量"].astype(float)).tail(20).sum())
+        if "振幅" in kline.columns:
+            avg_amp = float(kline["振幅"].astype(float).tail(20).mean())
+        else:
+            prev = closes.shift(1)
+            avg_amp = float(((kline["最高"].astype(float)
+                              - kline["最低"].astype(float)) / prev * 100)
+                             .tail(20).mean())
+        # 硬过滤（只适用于新分）：任一成立即显示「—」
+        if (flow.get("history_rows", 0) < 60
+                or "ST" in (name or "")  # 名称含 ST 作近似判断
+                or int(closes.tail(20).notna().sum()) < 18
+                or amount20 / 20 < 1.5e8
+                or bool((chg20 <= -9).any())):
+            return None, None, ""
+        net20 = fdf["主力净流入-净额"].astype(float).tail(20)
+        inflow_days20 = int((net20 > 0).sum())
+        net_ratio = (float(net20.sum()) / amount20 * 100
+                     if amount20 and amount20 > 0 else 0.0)
+        ma20 = float(closes.tail(20).mean())
+        bias20 = (float(closes.iloc[-1]) - ma20) / ma20 * 100
+        _, _, _, new_total = compute_scores_new(
+            inflow_days20, net_ratio, rel_20d, bias20,
+            float(kline["换手率"].astype(float).tail(20).mean()), avg_amp)
+        aux_total = round(0.6 * old_total + 0.4 * new_total, 1)
+        return new_total, aux_total, tag_dual(old_total, new_total)
+    except Exception as e:
+        _record_err(f"新综合分 {code}", e)
+        return None, None, ""
 
 
 def rel_label(rel_20d):
@@ -632,10 +795,18 @@ def build_watchlist():
             src = "模拟"
             meta["mock_codes"].append(code)
 
+        # 新综合分（参考展示）：旧分算完先计，唔影响旧分
+        if flow_ok:
+            new_total, aux_total, dual_tag = _new_score_for_stock(
+                code, w["名称"], flow, hist, rel_20d, total)
+        else:
+            new_total, aux_total, dual_tag = None, None, ""
+
         rows.append({
             "代码": code, "名称": w["名称"], "分类": w["分类"],
             "现价": round(price, 2), "涨跌幅": round(change_pct, 2),
             "潜伏分": latent, "质量分": quality, "趋势分": trend, "综合分": total,
+            "新综合分": new_total, "辅助参考分": aux_total, "打标": dual_tag,
             "持续流入天数": streak, "首次流入日期": first_date or "-",
             "累计净流入亿": cum, "相对大盘": rel_txt,
             "相对大盘数值": round(rel_20d, 2) if rel_20d is not None else None,
